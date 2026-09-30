@@ -57,6 +57,8 @@ type State = {
   closeFinding: (findingId: string) => void;
   toggleIssuanceCheck: (id: string) => void;
   reviseValue: (id: string, value: number, reason: string) => void;
+  supplementEvidence: (id: string) => void;
+  updateFactor: (id: string, factor: number) => void;
 };
 
 export const useCarbonStore = create<State>()(
@@ -78,6 +80,12 @@ export const useCarbonStore = create<State>()(
       reviseValue: (id, value, reason) => set((state) => ({
         records: state.records.map((record) => record.id === id ? { ...record, activity: value, revision: record.revision + 1, status: '复核中' } : record),
         findings: reason ? state.findings : state.findings
+      })),
+      supplementEvidence: (id) => set((state) => ({
+        records: state.records.map((record) => record.id === id ? { ...record, evidenceCount: record.evidenceCount + 1 } : record)
+      })),
+      updateFactor: (id, factor) => set((state) => ({
+        records: state.records.map((record) => record.id === id ? { ...record, factor, revision: record.revision + 1 } : record)
       }))
     }),
     { name: 'yy60-carbon-evidence' }

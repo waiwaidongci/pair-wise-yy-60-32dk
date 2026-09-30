@@ -1,8 +1,8 @@
 'use client';
 
 import Link from 'next/link';
-import { useMemo, useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { useMutation, useQuery } from '@tanstack/react-query';
 import {
   Alert,
   AppBar,
@@ -15,6 +15,7 @@ import {
   Chip,
   Divider,
   Drawer,
+  FormControlLabel,
   IconButton,
   LinearProgress,
   List,
@@ -24,6 +25,7 @@ import {
   MenuItem,
   Select,
   Stack,
+  Switch,
   Tab,
   Tabs,
   TextField,
@@ -38,8 +40,10 @@ import {
   CheckCircleOutlined,
   CloudUploadOutlined,
   DashboardOutlined,
+  DrawOutlined,
   FactCheckOutlined,
   FindInPageOutlined,
+  HistoryEduOutlined,
   MenuOutlined,
   MoreHorizOutlined,
   NotificationsNoneOutlined,
@@ -47,8 +51,9 @@ import {
   ScienceOutlined,
   TaskAltOutlined
 } from '@mui/icons-material';
-import { fetchEvidence } from '@/lib/api';
-import { useCarbonStore } from '@/lib/store';
+import { fetchEvidence, fetchSignOffs, registerDataChange, submitSignOff } from '@/lib/api';
+import { buildSnapshot, snapshotDiff, snapshotSummary, type ChangeSource, type SignOff, type SignOffSnapshot } from '@/lib/signoff';
+import { useCarbonStore, type CarbonRecord } from '@/lib/store';
 
 const drawerWidth = 232;
 
@@ -62,12 +67,171 @@ export default function EvidenceWorkbench({ initialView }: { initialView: View }
   const [correctionValue, setCorrectionValue] = useState('');
   const [correctionReason, setCorrectionReason] = useState('');
   const { data, isLoading } = useQuery({ queryKey: ['carbon-api'], queryFn: fetchEvidence });
+  const signoffsQuery = useQuery({ queryKey: ['signoffs'], queryFn: fetchSignOffs });
+  const signMutation = useMutation({ mutationFn: submitSignOff });
+  const changeMutation = useMutation({ mutationFn: registerDataChange });
   const store = useCarbonStore();
   const selected = store.records.find((record) => record.id === store.selectedRecordId) ?? store.records[0];
   const visibleRecords = useMemo(() => recordFilter === '全部' ? store.records : store.records.filter((record) => record.status === recordFilter), [recordFilter, store.records]);
   const totalReduction = store.records.reduce((total, record) => total + record.activity * record.factor / (record.unit === 'kWh' ? 1000 : record.unit === 'L' ? 1000 : 1), 0);
   const openFindings = store.findings.filter((item) => item.status !== '已关闭');
-  const allIssuanceChecked = Object.values(store.issuanceChecks).every(Boolean) && openFindings.length === 0;
+  const currentSnapshot = useMemo(() => buildSnapshot(store.records, store.sampledIds), [store.records, store.sampledIds]);
+  const dataVersion = signoffsQuery.data?.dataVersion ?? 0;
+  const validSignOff = signoffsQuery.data?.signOffs.find((item) => item.status === '有效' && item.baseVersion === dataVersion);
+  const allIssuanceChecked = Object.values(store.issuanceChecks).every(Boolean) && openFindings.length === 0 && Boolean(validSignOff);
+
+  type SignSubmitPayload = {
+    requestId: string;
+    actor: string;
+    note: string;
+    baseVersion: number;
+    snapshot: SignOffSnapshot;
+    supersedesId?: string;
+    failOnce?: boolean;
+  };
+
+  const [baseVersion, setBaseVersion] = useState<number | null>(null);
+  const [signNote, setSignNote] = useState('');
+  const [signActor, setSignActor] = useState('沈楠');
+  const [simulateFailure, setSimulateFailure] = useState(false);
+  const [conflict, setConflict] = useState<{ baseVersion: number; currentVersion: number; sources: ChangeSource[]; draft: SignOff } | null>(null);
+  const [failedRequest, setFailedRequest] = useState<{ requestId: string; payload: SignSubmitPayload } | null>(null);
+  const [factorOpen, setFactorOpen] = useState(false);
+  const [factorTarget, setFactorTarget] = useState<CarbonRecord | null>(null);
+  const [factorValue, setFactorValue] = useState('');
+  const signRequestRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (signoffsQuery.data && baseVersion === null) {
+      setBaseVersion(signoffsQuery.data.dataVersion);
+    }
+  }, [signoffsQuery.data, baseVersion]);
+
+  const resetSignRequest = () => {
+    signRequestRef.current = null;
+    setFailedRequest(null);
+    setSimulateFailure(false);
+  };
+
+  const handleSign = async (supersedesId?: string) => {
+    if (baseVersion == null) return;
+    const requestId = signRequestRef.current ?? `REQ-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
+    signRequestRef.current = requestId;
+    const payload: SignSubmitPayload = {
+      requestId,
+      actor: signActor,
+      note: signNote.trim(),
+      baseVersion,
+      snapshot: currentSnapshot,
+      supersedesId,
+      failOnce: simulateFailure
+    };
+    try {
+      const result = await signMutation.mutateAsync(payload);
+      if (result.kind === 'conflict') {
+        setConflict({ baseVersion: result.baseVersion, currentVersion: result.currentVersion, sources: result.sources, draft: result.draft });
+        setFailedRequest(null);
+      } else {
+        setConflict(null);
+        resetSignRequest();
+        setSignNote('');
+        setBaseVersion(dataVersion);
+        void signoffsQuery.refetch();
+      }
+    } catch {
+      setFailedRequest({ requestId, payload });
+      setSimulateFailure(false);
+    }
+  };
+
+  const handleRetry = async () => {
+    if (!failedRequest) return;
+    try {
+      const result = await signMutation.mutateAsync({ ...failedRequest.payload, failOnce: false });
+      if (result.kind === 'conflict') {
+        setConflict({ baseVersion: result.baseVersion, currentVersion: result.currentVersion, sources: result.sources, draft: result.draft });
+        setFailedRequest(null);
+      } else {
+        setConflict(null);
+        resetSignRequest();
+        setSignNote('');
+        setBaseVersion(dataVersion);
+        void signoffsQuery.refetch();
+      }
+    } catch {
+      /* 保留失败状态，等待再次重试 */
+    }
+  };
+
+  const handleConfirmDraft = async (draft: SignOff) => {
+    if (!signoffsQuery.data) return;
+    const requestId = `REQ-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
+    const payload: SignSubmitPayload = {
+      requestId,
+      actor: draft.actor,
+      note: draft.note,
+      baseVersion: signoffsQuery.data.dataVersion,
+      snapshot: currentSnapshot,
+      supersedesId: draft.id
+    };
+    try {
+      const result = await signMutation.mutateAsync(payload);
+      if (result.kind === 'conflict') {
+        setConflict({ baseVersion: result.baseVersion, currentVersion: result.currentVersion, sources: result.sources, draft: result.draft });
+      } else {
+        setConflict(null);
+        setBaseVersion(signoffsQuery.data.dataVersion);
+        void signoffsQuery.refetch();
+      }
+    } catch {
+      setFailedRequest({ requestId, payload });
+    }
+  };
+
+  const handleChange = async (sources: ChangeSource[], nextSnapshot: SignOffSnapshot) => {
+    const requestId = `CHG-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
+    try {
+      await changeMutation.mutateAsync({ requestId, sources, snapshot: nextSnapshot });
+      void signoffsQuery.refetch();
+    } catch {
+      /* 变更失败时保留本地状态，可稍后重试 */
+    }
+  };
+
+  const handleToggleSample = (id: string) => {
+    const prev = buildSnapshot(store.records, store.sampledIds);
+    const nextIds = store.sampledIds.includes(id) ? store.sampledIds.filter((item) => item !== id) : [...store.sampledIds, id];
+    store.toggleSample(id);
+    const next = buildSnapshot(store.records, nextIds);
+    void handleChange(snapshotDiff(prev, next), next);
+  };
+
+  const handleSupplement = (record: CarbonRecord) => {
+    const prev = buildSnapshot(store.records, store.sampledIds);
+    const nextRecords = store.records.map((item) => item.id === record.id ? { ...item, evidenceCount: item.evidenceCount + 1 } : item);
+    store.supplementEvidence(record.id);
+    const next = buildSnapshot(nextRecords, store.sampledIds);
+    void handleChange(snapshotDiff(prev, next), next);
+  };
+
+  const openFactorDialog = (record: CarbonRecord) => {
+    setFactorTarget(record);
+    setFactorValue(String(record.factor));
+    setFactorOpen(true);
+  };
+
+  const handleFactorUpdate = () => {
+    if (!factorTarget) return;
+    const factor = Number(factorValue);
+    if (!Number.isFinite(factor)) return;
+    const prev = buildSnapshot(store.records, store.sampledIds);
+    const nextRecords = store.records.map((item) => item.id === factorTarget.id ? { ...item, factor, revision: item.revision + 1 } : item);
+    store.updateFactor(factorTarget.id, factor);
+    const next = buildSnapshot(nextRecords, store.sampledIds);
+    void handleChange(snapshotDiff(prev, next), next);
+    setFactorOpen(false);
+    setFactorTarget(null);
+  };
 
   const nav = [
     { id: 'overview', label: '监测期总览', href: '/', icon: DashboardOutlined },
@@ -130,7 +294,8 @@ export default function EvidenceWorkbench({ initialView }: { initialView: View }
               <Typography variant="h5" fontWeight={850} mt={.3}>{view === 'overview' ? '监测期总览' : view === 'verify' ? '证据与抽样核验' : '签发准备'}</Typography>
               <Typography variant="body2" color="text.secondary" mt={.5}>{view === 'overview' ? '汇总活动数据、排放因子、证据完整度和异常波动。' : view === 'verify' ? '逐项核对来源、单位、时间范围，并保留修订链。' : '关闭发现项并完成签发前完整性门禁。'}</Typography>
             </Box>
-            <Stack direction="row" spacing={1}>
+            <Stack direction="row" spacing={1} alignItems="center">
+              <Chip size="small" variant="outlined" icon={<HistoryEduOutlined />} label={`数据版本 V${dataVersion}`} />
               <Button variant="outlined" startIcon={<CloudUploadOutlined />}>导入监测数据</Button>
               <Button variant="contained" startIcon={<TaskAltOutlined />} disabled={view !== 'issuance' || !allIssuanceChecked}>提交签发准备</Button>
             </Stack>
@@ -195,24 +360,114 @@ export default function EvidenceWorkbench({ initialView }: { initialView: View }
                 </Stack><Divider />
                 {store.records.map((record) => (
                   <Box key={record.id} sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: '22px minmax(210px, 1.3fr) .8fr .8fr .8fr auto' }, alignItems: 'center', gap: 1.2, px: 1.6, py: 1.3, borderTop: '1px solid #edf0ef' }}>
-                    <input type="checkbox" checked={store.sampledIds.includes(record.id)} onChange={() => store.toggleSample(record.id)} aria-label={`抽样 ${record.id}`} />
+                    <input type="checkbox" checked={store.sampledIds.includes(record.id)} onChange={() => handleToggleSample(record.id)} aria-label={`抽样 ${record.id}`} />
                     <Box><Typography fontSize={12.5} fontWeight={700}>{record.source}</Typography><Typography fontSize={10} color="text.secondary">{record.id} · 证据 {record.evidenceCount} 份</Typography></Box>
                     <Box><Typography variant="caption" color="text.secondary">来源</Typography><Typography fontSize={11}>原始计量记录</Typography></Box>
                     <Box><Typography variant="caption" color="text.secondary">单位</Typography><Typography fontSize={11}>{record.unit} / {record.factorUnit}</Typography></Box>
                     <Box><Typography variant="caption" color="text.secondary">时间范围</Typography><Typography fontSize={11}>{record.timeRange.includes('至') ? '已覆盖整期' : '待检查'}</Typography></Box>
-                    <Stack direction="row" spacing={.7}><Button size="small" variant="outlined" onClick={() => store.startCorrection(record.id)}>复核</Button><Button size="small" variant="contained" disabled={record.status === '需补证'} onClick={() => store.verifyRecord(record.id)}>通过</Button></Stack>
+                    <Stack direction="row" spacing={.7} flexWrap="wrap" useFlexGap><Button size="small" variant="outlined" onClick={() => store.startCorrection(record.id)}>复核</Button><Button size="small" variant="contained" disabled={record.status === '需补证'} onClick={() => store.verifyRecord(record.id)}>通过</Button><Button size="small" variant="outlined" color="secondary" onClick={() => handleSupplement(record)}>补证</Button><Button size="small" variant="outlined" color="secondary" onClick={() => openFactorDialog(record)}>更新因子</Button></Stack>
                   </Box>
                 ))}
               </Card>
               <Stack spacing={1.5}>
                 <Card elevation={0} variant="outlined"><CardContent><Typography fontWeight={800} fontSize={14} mb={1.3}>发现项闭环</Typography>{store.findings.map((finding) => <Box key={finding.id} sx={{ borderTop: '1px solid #edf0ef', py: 1.2 }}><Stack direction="row" justifyContent="space-between"><Typography fontSize={12} fontWeight={700}>{finding.title}</Typography><Chip size="small" label={finding.status} color={finding.status === '已关闭' ? 'success' : finding.status === '补证中' ? 'warning' : 'error'} /></Stack><Typography fontSize={10.5} color="text.secondary" mt={.5}>{finding.detail}</Typography><Stack direction="row" spacing={.7} mt={1}><Button size="small" disabled={finding.status === '已关闭'} onClick={() => store.requestEvidence(finding.id)}>发起补证</Button><Button size="small" disabled={finding.status === '已关闭'} onClick={() => store.closeFinding(finding.id)}>关闭</Button></Stack></Box>)}</CardContent></Card>
                 <Alert severity="info">任何数据修订都会生成新版本，原始提交和计算链不会被覆盖。</Alert>
+                <Card elevation={0} variant="outlined">
+                  <CardContent>
+                    <Stack direction="row" justifyContent="space-between" alignItems="center">
+                      <Stack direction="row" spacing={.7} alignItems="center">
+                        <DrawOutlined color="primary" fontSize="small" />
+                        <Typography fontWeight={800} fontSize={14}>签字与版本</Typography>
+                      </Stack>
+                      <Chip size="small" variant="outlined" label={`数据版本 V${dataVersion}`} />
+                    </Stack>
+                    <Typography fontSize={11} color="text.secondary" mt={.5}>签字时冻结抽样范围、证据份数与因子版本；数据变更后旧签字失效，仅生成待复核副本，原签字仍可查。</Typography>
+                    <Box sx={{ mt: 1.2, p: 1.2, bgcolor: '#f4f7f5', borderRadius: 1 }}>
+                      <Typography fontSize={11} color="text.secondary">冻结快照（页面打开时 V{baseVersion ?? '-'}）</Typography>
+                      <Typography fontSize={12.5} fontWeight={700} mt={.3}>{snapshotSummary(currentSnapshot)}</Typography>
+                      <Stack direction="row" spacing={.5} mt={.7} flexWrap="wrap" useFlexGap>
+                        {currentSnapshot.sampledIds.map((id) => <Chip key={id} size="small" label={id} variant="outlined" />)}
+                      </Stack>
+                    </Box>
+                    <Stack direction="row" spacing={1} mt={1.2}>
+                      <TextField size="small" select label="核验员" value={signActor} onChange={(event) => setSignActor(event.target.value)} sx={{ width: 116 }}>
+                        <MenuItem value="沈楠">沈楠</MenuItem>
+                        <MenuItem value="韩跃">韩跃</MenuItem>
+                      </TextField>
+                      <TextField fullWidth size="small" label="签字意见" value={signNote} onChange={(event) => setSignNote(event.target.value)} placeholder="如：抽样范围与证据链已核对" />
+                    </Stack>
+                    <Stack direction="row" spacing={1} mt={1.2} alignItems="center" flexWrap="wrap" useFlexGap>
+                      <Button size="small" variant="contained" startIcon={<CheckCircleOutlined />} disabled={!signNote.trim() || baseVersion == null || signMutation.isPending} onClick={() => handleSign()}>签字提交</Button>
+                      <FormControlLabel control={<Switch size="small" checked={simulateFailure} onChange={(event) => setSimulateFailure(event.target.checked)} />} label={<Typography fontSize={11}>模拟写入失败（确认丢失）</Typography>} />
+                    </Stack>
+                    {conflict && (
+                      <Alert severity="warning" sx={{ mt: 1.2 }}>
+                        <Typography fontSize={12.5} fontWeight={700}>版本冲突：打开页面时为 V{conflict.baseVersion}，当前已为 V{conflict.currentVersion}</Typography>
+                        <Typography fontSize={11.5} mt={.3}>以下变化导致失效：</Typography>
+                        <Box component="ul" sx={{ m: 0, pl: 2.2, mt: .3 }}>
+                          {conflict.sources.map((source, index) => (
+                            <Typography key={index} component="li" fontSize={11.5}>{source.type}{source.recordId ? ` ${source.recordId}` : ''}：{source.from} → {source.to}</Typography>
+                          ))}
+                        </Box>
+                        <Typography fontSize={11.5} mt={.3}>已保留你填写的内容并生成待复核副本 {conflict.draft.id}。</Typography>
+                        <Stack direction="row" spacing={1} mt={.8}>
+                          <Button size="small" variant="outlined" onClick={() => handleConfirmDraft(conflict.draft)}>基于当前版本重新签字</Button>
+                        </Stack>
+                      </Alert>
+                    )}
+                    {failedRequest && (
+                      <Alert severity="error" sx={{ mt: 1.2 }}>
+                        <Typography fontSize={12.5} fontWeight={700}>写入失败，确认丢失</Typography>
+                        <Typography fontSize={11.5} mt={.3}>请求编号 {failedRequest.requestId}。服务端可能已写入，重试使用原编号幂等回放，不会追加重复核验记录。</Typography>
+                        <Button size="small" variant="outlined" sx={{ mt: .8 }} onClick={handleRetry} disabled={signMutation.isPending}>用原请求编号重试</Button>
+                      </Alert>
+                    )}
+                    <Divider sx={{ my: 1.3 }} />
+                    <Typography fontSize={12} fontWeight={700}>签字记录</Typography>
+                    <Stack spacing={.8} mt={.8}>
+                      {(signoffsQuery.data?.signOffs ?? []).length === 0 && <Typography fontSize={11.5} color="text.secondary">暂无签字记录。</Typography>}
+                      {signoffsQuery.data?.signOffs.map((sign) => (
+                        <Box key={sign.id} sx={{ border: '1px solid', borderColor: 'divider', borderRadius: 1, p: 1 }}>
+                          <Stack direction="row" justifyContent="space-between" alignItems="center">
+                            <Stack direction="row" spacing={.7} alignItems="center">
+                              <Chip size="small" label={sign.status} color={sign.status === '有效' ? 'success' : sign.status === '已失效' ? 'default' : sign.status === '待复核副本' ? 'warning' : 'info'} variant={sign.status === '有效' ? 'filled' : 'outlined'} />
+                              <Typography fontSize={12} fontWeight={700}>{sign.actor}</Typography>
+                            </Stack>
+                            <Typography fontSize={10.5} color="text.secondary">V{sign.baseVersion} · {new Date(sign.createdAt).toLocaleTimeString('zh-CN', { hour12: false })}</Typography>
+                          </Stack>
+                          <Typography fontSize={11.5} mt={.4}>{sign.note || '（未填写意见）'}</Typography>
+                          <Typography fontSize={10.5} color="text.secondary" mt={.3}>{snapshotSummary(sign.snapshot)}</Typography>
+                          {sign.status === '已失效' && sign.sources && sign.sources.length > 0 && (
+                            <Typography fontSize={10.5} color="warning.main" mt={.3}>失效来源：{sign.sources.map((source) => `${source.type}${source.recordId ? ` ${source.recordId}` : ''} ${source.from}→${source.to}`).join('；')}</Typography>
+                          )}
+                          {sign.status === '待复核副本' && (
+                            <Button size="small" variant="outlined" sx={{ mt: .6 }} onClick={() => handleConfirmDraft(sign)}>基于此副本签字</Button>
+                          )}
+                          {sign.supersedesId && <Typography fontSize={10.5} color="text.secondary" mt={.3}>承接原签字 {sign.supersedesId}</Typography>}
+                          {sign.supersededById && <Typography fontSize={10.5} color="text.secondary" mt={.3}>已由 {sign.supersededById} 承接</Typography>}
+                        </Box>
+                      ))}
+                    </Stack>
+                  </CardContent>
+                </Card>
               </Stack>
             </Box>
           )}
 
           {view === 'issuance' && (
-            <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', lg: 'minmax(0, 1fr) 380px' }, gap: 1.5 }}>
+            <>
+              <Alert
+                severity={validSignOff ? 'success' : 'warning'}
+                sx={{ mb: 1.5 }}
+                action={!validSignOff ? <Button color="inherit" size="small" component={Link} href="/verify">去签字</Button> : undefined}
+              >
+                {validSignOff
+                  ? `签字有效 · 版本 V${dataVersion} · 抽样 ${validSignOff.snapshot.sampledIds.length} 条已冻结，可提交签发准备。`
+                  : signoffsQuery.data?.signOffs.some((item) => item.status === '已失效')
+                    ? '签字已失效：数据版本已更新，已生成待复核副本，重新签字后门禁才会放行。'
+                    : '尚未签字：请先在证据与抽样核验页完成签字，冻结抽样范围、证据份数与因子版本。'}
+              </Alert>
+              <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', lg: 'minmax(0, 1fr) 380px' }, gap: 1.5 }}>
               <Card elevation={0} variant="outlined">
                 <CardContent>
                   <Typography fontWeight={800} fontSize={14}>签发前完整性检查</Typography>
@@ -231,6 +486,7 @@ export default function EvidenceWorkbench({ initialView }: { initialView: View }
                 <Alert severity={allIssuanceChecked ? 'success' : 'warning'}>{allIssuanceChecked ? '全部门禁已完成，可提交签发准备。' : '关闭开放发现项并完成所有检查后可提交。'}</Alert>
               </Stack>
             </Box>
+            </>
           )}
         </Box>
       </Box>
@@ -245,6 +501,16 @@ export default function EvidenceWorkbench({ initialView }: { initialView: View }
             <TextField fullWidth size="small" label="修订原因" multiline rows={3} value={correctionReason} onChange={(event) => setCorrectionReason(event.target.value)} margin="normal" />
             {!correctionReason.trim() && <Alert severity="warning">必须填写修订原因。</Alert>}
             <Stack direction="row" spacing={1} justifyContent="flex-end" mt={2}><Button onClick={() => setCorrectionOpen(false)}>取消</Button><Button variant="contained" disabled={!correctionReason.trim() || !Number(correctionValue)} onClick={() => { store.reviseValue(selected.id, Number(correctionValue), correctionReason); setCorrectionOpen(false); setCorrectionReason(''); }}>生成新版本</Button></Stack>
+          </CardContent></Card>
+        </Box>
+      )}
+      {factorOpen && (
+        <Box sx={{ position: 'fixed', inset: 0, zIndex: 60, bgcolor: 'rgba(15,25,22,.4)', display: 'grid', placeItems: 'center', p: 2 }} onMouseDown={() => setFactorOpen(false)}>
+          <Card sx={{ width: 'min(420px, 100%)' }} onMouseDown={(event) => event.stopPropagation()}><CardContent sx={{ p: 2.2 }}>
+            <Typography variant="h6" fontWeight={800}>更新排放因子</Typography>
+            <Typography variant="body2" color="text.secondary" mt={.5}>{factorTarget?.id} · {factorTarget?.source}。更新将冻结新版本因子，旧签字失效并生成待复核副本。</Typography>
+            <TextField fullWidth size="small" label={`排放因子 / ${factorTarget?.factorUnit ?? ''}`} value={factorValue} onChange={(event) => setFactorValue(event.target.value)} margin="normal" />
+            <Stack direction="row" spacing={1} justifyContent="flex-end" mt={2}><Button onClick={() => setFactorOpen(false)}>取消</Button><Button variant="contained" disabled={!Number(factorValue)} onClick={handleFactorUpdate}>更新因子</Button></Stack>
           </CardContent></Card>
         </Box>
       )}
